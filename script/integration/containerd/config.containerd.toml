@@ -1,4 +1,11 @@
-[proxy_plugins]
-  [proxy_plugins.stargz]
-    type = "snapshot"
-    address = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+version = 2
+
+[plugins."io.containerd.snapshotter.v1.stargz"]
+root_path = "/var/lib/containerd-stargz-grpc/"
+disable_verification = false
+
+[plugins."io.containerd.snapshotter.v1.stargz".blob]
+check_always = true
+
+[plugins."io.containerd.snapshotter.v1.stargz".registry.mirrors."registry-integration.test"]
+endpoint = ["http://registry-alt.test:5000"]

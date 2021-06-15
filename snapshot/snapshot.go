@@ -31,13 +31,17 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/containerd/snapshots/storage"
 	"github.com/containerd/continuity/fs"
+	"github.com/containerd/stargz-snapshotter/snapshot/overlayutils"
+	"github.com/moby/sys/mountinfo"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
 	targetSnapshotLabel = "containerd.io/snapshot.ref"
 	remoteLabel         = "containerd.io/snapshot/remote"
+	remoteLabelVal      = "remote snapshot"
 
 	// remoteSnapshotLogKey is a key for log line, which indicates whether
 	// `Prepare` method successfully prepared targeting remote snapshot or not, as
@@ -90,7 +94,8 @@ type snapshotter struct {
 	asyncRemove bool
 
 	// fs is a filesystem that this snapshotter recognizes.
-	fs FileSystem
+	fs        FileSystem
+	userxattr bool // whether to enable "userxattr" mount option
 }
 
 // NewSnapshotter returns a Snapshotter which can use unpacked remote layers
@@ -128,11 +133,17 @@ func NewSnapshotter(ctx context.Context, root string, targetFs FileSystem, opts 
 		return nil, err
 	}
 
+	userxattr, err := overlayutils.NeedsUserXAttr(root)
+	if err != nil {
+		logrus.WithError(err).Warnf("cannot detect whether \"userxattr\" option needs to be used, assuming to be %v", userxattr)
+	}
+
 	o := &snapshotter{
 		root:        root,
 		ms:          ms,
 		asyncRemove: config.asyncRemove,
 		fs:          targetFs,
+		userxattr:   userxattr,
 	}
 
 	if err := o.restoreRemoteSnapshot(ctx); err != nil {
@@ -235,8 +246,11 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 		//       or not, using the key `remoteSnapshotLogKey` defined in the above. This
 		//       log is used by tests in this project.
 		lCtx := log.WithLogger(ctx, log.G(ctx).WithField("key", key).WithField("parent", parent))
-		if err := o.prepareRemoteSnapshot(ctx, key, base.Labels); err == nil {
-			base.Labels[remoteLabel] = fmt.Sprintf("remote snapshot") // Mark this snapshot as remote
+		if err := o.prepareRemoteSnapshot(ctx, key, base.Labels); err != nil {
+			log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).
+				WithError(err).Debug("failed to prepare remote snapshot")
+		} else {
+			base.Labels[remoteLabel] = remoteLabelVal // Mark this snapshot as remote
 			err := o.Commit(ctx, target, key, append(opts, snapshots.WithLabels(base.Labels))...)
 			if err == nil || errdefs.IsAlreadyExists(err) {
 				// count also AlreadyExists as "success"
@@ -249,8 +263,6 @@ func (o *snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 			// possible has done some work on this "upper" directory.
 			return nil, err
 		}
-		log.G(lCtx).WithField(remoteSnapshotLogKey, prepareFailed).
-			WithError(err).Debug("failed to prepare remote snapshot")
 	}
 
 	return o.mounts(ctx, s, parent)
@@ -596,6 +608,9 @@ func (o *snapshotter) mounts(ctx context.Context, s storage.Snapshot, checkKey s
 	}
 
 	options = append(options, fmt.Sprintf("lowerdir=%s", strings.Join(parentPaths, ":")))
+	if o.userxattr {
+		options = append(options, "userxattr")
+	}
 	return []mount.Mount{
 		{
 			Type:    "overlay",
@@ -688,7 +703,7 @@ func (o *snapshotter) checkAvailability(ctx context.Context, key string) bool {
 }
 
 func (o *snapshotter) restoreRemoteSnapshot(ctx context.Context) error {
-	mounts, err := mount.Self()
+	mounts, err := mountinfo.GetMounts(nil)
 	if err != nil {
 		return err
 	}

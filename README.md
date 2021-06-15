@@ -1,7 +1,14 @@
+[[⬇️ **Download**]](https://github.com/containerd/stargz-snapshotter/releases)
+[[📔**Browse images**]](./docs/pre-converted-images.md)
+[[☸**Quick Start (Kubernetes)**]](#quick-start-with-kubernetes)
+[[🤓**Quick Start (nerdctl)**]](https://github.com/containerd/nerdctl/blob/master/docs/stargz.md)
+[[🔆**Install**]](./docs/INSTALL.md)
+
 # Stargz Snapshotter
 
 [![Tests Status](https://github.com/containerd/stargz-snapshotter/workflows/Tests/badge.svg)](https://github.com/containerd/stargz-snapshotter/actions?query=workflow%3ATests+branch%3Amaster)
 [![Benchmarking](https://github.com/containerd/stargz-snapshotter/workflows/Benchmark/badge.svg)](https://github.com/containerd/stargz-snapshotter/actions?query=workflow%3ABenchmark+branch%3Amaster)
+[![Nightly](https://github.com/containerd/stargz-snapshotter/workflows/Nightly/badge.svg)](https://github.com/containerd/stargz-snapshotter/actions?query=workflow%3ANightly+branch%3Amaster)
 
 Read also introductory blog: [Startup Containers in Lightning Speed with Lazy Image Distribution on Containerd](https://medium.com/nttlabs/startup-containers-in-lightning-speed-with-lazy-image-distribution-on-containerd-243d94522361)
 
@@ -37,6 +44,7 @@ Stargz Snapshotter is a **non-core** sub-project of containerd.
 ## Quick Start with Kubernetes
 
 - For more details about stargz snapshotter plugin and its configuration, refer to [Containerd Stargz Snapshotter Plugin Overview](/docs/overview.md).
+- For more details about setup lazy pulling of eStargz with containerd, CRI-O, Podman, systemd, etc., refer to [Install Stargz Snapshotter and Stargz Store](./docs/INSTALL.md).
 
 For using stargz snapshotter on kubernetes nodes, you need the following configuration to containerd as well as run stargz snapshotter daemon on the node.
 We assume that you are using containerd (> v1.4.2) as a CRI runtime.
@@ -132,27 +140,39 @@ Generally, container images are built with purpose and the *workloads* are defin
 By default, `ctr-remote` optimizes the performance of reading files that are most likely accessed in the workload defined in the Dockerfile.
 [You can also specify the custom workload using options if needed](/docs/ctr-remote.md).
 
-The following example converts the legacy `library/ubuntu:18.04` image into eStargz.
+The following example converts the legacy `library/ubuntu:20.04` image into eStargz.
 The command also optimizes the image for the workload of executing `ls` on `/bin/bash`.
 The thing actually done is it runs the specified workload in a temporary container and profiles all file accesses with marking them as *likely accessed* also during runtime.
-Then it pushes the converted image to the local container registry (`registry2:5000`).
 The converted image is still **docker-compatible** so you can run it with eStargz-agnostic runtimes (e.g. Docker).
 
 ```console
-# ctr-remote image optimize --plain-http --entrypoint='[ "/bin/bash", "-c" ]' --args='[ "ls" ]' ubuntu:18.04 http://registry2:5000/ubuntu:18.04
+# ctr-remote image pull docker.io/library/ubuntu:20.04
+# ctr-remote image optimize --oci --entrypoint='[ "/bin/bash", "-c" ]' --args='[ "ls" ]' docker.io/library/ubuntu:20.04 registry2:5000/ubuntu:20.04
+# ctr-remote image push --plain-http registry2:5000/ubuntu:20.04
 ```
 
-Finally, the following commands pull the eStargz image lazily.
+Finally, the following commands clear the local cache then pull the eStargz image lazily.
 Stargz snapshotter prefetches files that are most likely accessed in the optimized workload, which hopefully increases the cache hit rate for that workload and mitigates runtime overheads as shown in the benchmarking result shown top of this doc.
 
 ```console
-# ctr-remote images rpull --plain-http registry2:5000/ubuntu:18.04
-fetching sha256:728332a6... application/vnd.docker.distribution.manifest.v2+json
-fetching sha256:80026893... application/vnd.docker.container.image.v1+json
-# ctr-remote run --rm -t --snapshotter=stargz registry2:5000/ubuntu:18.04 test /bin/bash
-root@8dab301bd68d:/# ls
-bin  boot  dev  etc  home  lib  lib64  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
+# ctr-remote image rm --sync registry2:5000/ubuntu:20.04
+# ctr-remote images rpull --plain-http registry2:5000/ubuntu:20.04
+fetching sha256:610399d1... application/vnd.oci.image.index.v1+json
+fetching sha256:0b4a26b4... application/vnd.oci.image.manifest.v1+json
+fetching sha256:8d8d9dbe... application/vnd.oci.image.config.v1+json
+# ctr-remote run --rm -t --snapshotter=stargz registry2:5000/ubuntu:20.04 test /bin/bash
+root@8eabb871a9bd:/# ls
+bin  boot  dev  etc  home  lib  lib32  lib64  libx32  media  mnt  opt  proc  root  run  sbin  srv  sys  tmp  usr  var
 ```
+
+## Importing Stargz Snapshotter as go module
+
+Currently, Stargz Snapshotter repository contains two Go modules as the following and both of them need to be imported.
+
+- `github.com/containerd/stargz-snapshotter`
+- `github.com/containerd/stargz-snapshotter/estargz`
+
+Please make sure you import the both of them and they point to *the same commit version*.
 
 ## Project details
 

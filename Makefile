@@ -18,11 +18,16 @@ CMD_DESTDIR ?= /usr/local
 GO111MODULE_VALUE=auto
 PREFIX ?= out/
 
-CMD=containerd-stargz-grpc ctr-remote
+PKG=github.com/containerd/stargz-snapshotter
+VERSION=$(shell git describe --match 'v[0-9]*' --dirty='.m' --always --tags)
+REVISION=$(shell git rev-parse HEAD)$(shell if ! git diff --no-ext-diff --quiet --exit-code; then echo .m; fi)
+GO_LD_FLAGS=-ldflags '-s -w -X $(PKG)/version.Version=$(VERSION) -X $(PKG)/version.Revision=$(REVISION) $(GO_EXTRA_LDFLAGS)'
+
+CMD=containerd-stargz-grpc ctr-remote stargz-store
 
 CMD_BINARIES=$(addprefix $(PREFIX),$(CMD))
 
-.PHONY: all build check install-check-tools install uninstall clean test test-root test-all integration test-optimize benchmark test-pullsecrets test-cri
+.PHONY: all build check install-check-tools install uninstall clean test test-root test-all integration test-optimize benchmark test-pullsecrets test-cri-containerd test-cri-o test-criauth
 
 all: build
 
@@ -31,10 +36,13 @@ build: $(CMD)
 FORCE:
 
 containerd-stargz-grpc: FORCE
-	GO111MODULE=$(GO111MODULE_VALUE) go build -o $(PREFIX)$@ $(GO_BUILD_FLAGS) -v ./cmd/containerd-stargz-grpc
+	GO111MODULE=$(GO111MODULE_VALUE) go build -o $(PREFIX)$@ $(GO_BUILD_FLAGS) $(GO_LD_FLAGS) -v ./cmd/containerd-stargz-grpc
 
 ctr-remote: FORCE
-	GO111MODULE=$(GO111MODULE_VALUE) go build -o $(PREFIX)$@ $(GO_BUILD_FLAGS) -v ./cmd/ctr-remote
+	GO111MODULE=$(GO111MODULE_VALUE) go build -o $(PREFIX)$@ $(GO_BUILD_FLAGS) $(GO_LD_FLAGS) -v ./cmd/ctr-remote
+
+stargz-store: FORCE
+	GO111MODULE=$(GO111MODULE_VALUE) go build -o $(PREFIX)$@ $(GO_BUILD_FLAGS) $(GO_LD_FLAGS) -v ./cmd/stargz-store
 
 check:
 	@echo "$@"
@@ -42,7 +50,7 @@ check:
 	@cd ./estargz ; GO111MODULE=$(GO111MODULE_VALUE) golangci-lint run
 
 install-check-tools:
-	@curl -sfL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s -- -b $(go env GOPATH)/bin v1.19.1
+	@curl -sfL https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s -- -b $(go env GOPATH)/bin v1.39.0
 
 install:
 	@echo "$@"
@@ -80,5 +88,14 @@ benchmark:
 test-pullsecrets:
 	@./script/pullsecrets/test.sh
 
-test-cri:
-	@./script/cri/test.sh
+test-cri-containerd:
+	@./script/cri-containerd/test.sh
+
+test-cri-o:
+	@./script/cri-o/test.sh
+
+test-criauth:
+	@./script/criauth/test.sh
+
+test-k3s:
+	@./script/k3s/test.sh

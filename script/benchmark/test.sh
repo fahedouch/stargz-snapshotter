@@ -23,12 +23,24 @@ BENCHMARKING_BASE_IMAGE_NAME="benchmark-image-base"
 BENCHMARKING_NODE_IMAGE_NAME="benchmark-image-test"
 BENCHMARKING_NODE=hello-bench
 BENCHMARKING_CONTAINER=hello-bench-container
-BENCHMARKING_CNI_PLUGIN_URL="https://github.com/containernetworking/plugins/releases/download/v0.8.7/cni-plugins-linux-amd64-v0.8.7.tgz"
+
+BENCHMARKING_TARGET_BASE_IMAGE=
+BENCHMARKING_TARGET_CONFIG_DIR=
+if [ "${BENCHMARK_RUNTIME_MODE}" == "containerd" ] ; then
+    BENCHMARKING_TARGET_BASE_IMAGE=snapshotter-base
+    BENCHMARKING_TARGET_CONFIG_DIR="${CONTEXT}/config-containerd"
+elif [ "${BENCHMARK_RUNTIME_MODE}" == "podman" ] ; then
+    BENCHMARKING_TARGET_BASE_IMAGE=podman-base
+    BENCHMARKING_TARGET_CONFIG_DIR="${CONTEXT}/config-podman"
+else
+    echo "Unknown runtime: ${BENCHMARK_RUNTIME_MODE}"
+    exit 1
+fi
 
 if [ "${BENCHMARKING_NO_RECREATE:-}" != "true" ] ; then
     echo "Preparing node image..."
-    docker build -t "${BENCHMARKING_BASE_IMAGE_NAME}" --target snapshotter-base \
-           ${DOCKER_BUILD_ARGS:-} "${REPO}"
+    docker build ${DOCKER_BUILD_ARGS:-} -t "${BENCHMARKING_BASE_IMAGE_NAME}" \
+           --target "${BENCHMARKING_TARGET_BASE_IMAGE}" "${REPO}"
 fi
 
 DOCKER_COMPOSE_YAML=$(mktemp)
@@ -41,24 +53,20 @@ function cleanup {
 }
 trap 'cleanup "$?"' EXIT SIGHUP SIGINT SIGQUIT SIGTERM
 
-cp -R "${CONTEXT}/config" "${TMP_CONTEXT}"
+cp -R "${BENCHMARKING_TARGET_CONFIG_DIR}" "${TMP_CONTEXT}/config"
 
 cat <<EOF > "${TMP_CONTEXT}/Dockerfile"
 FROM ${BENCHMARKING_BASE_IMAGE_NAME}
 
 RUN apt-get update -y && \
-    apt-get --no-install-recommends install -y python jq iptables && \
-    update-alternatives --set iptables /usr/sbin/iptables-legacy && \
-    mkdir -p /opt/cni/bin && curl -Ls "${BENCHMARKING_CNI_PLUGIN_URL}" | tar xzv -C /opt/cni/bin && \
+    apt-get --no-install-recommends install -y python jq && \
     git clone https://github.com/google/go-containerregistry \
               \${GOPATH}/src/github.com/google/go-containerregistry && \
     cd \${GOPATH}/src/github.com/google/go-containerregistry && \
     git checkout 4b1985e5ea2104672636879e1694808f735fd214 && \
     GO111MODULE=on go get github.com/google/go-containerregistry/cmd/crane
 
-COPY ./config/config.containerd.toml /etc/containerd/config.toml
-COPY ./config/config.stargz.toml /etc/containerd-stargz-grpc/config.toml
-COPY ./config/config.cni.conflist /etc/cni/net.d/optimizer.conflist
+COPY ./config /
 
 ENV CONTAINERD_SNAPSHOTTER=""
 
@@ -89,9 +97,13 @@ services:
     - "/dev/fuse:/dev/fuse"
     - "containerd-data:/var/lib/containerd:delegated"
     - "containerd-stargz-grpc-data:/var/lib/containerd-stargz-grpc:delegated"
+    - "containers-data:/var/lib/containers:delegated"
+    - "additional-store-data:/var/lib/stargz-store:delegated"
 volumes:
   containerd-data:
   containerd-stargz-grpc-data:
+  containers-data:
+  additional-store-data:
 EOF
 
 echo "Preparing for benchmark..."
@@ -114,7 +126,8 @@ if ! ( cd "${CONTEXT}" && \
            docker-compose -f "${DOCKER_COMPOSE_YAML}" build ${DOCKER_BUILD_ARGS:-} \
                           "${BENCHMARKING_NODE}" && \
            docker-compose -f "${DOCKER_COMPOSE_YAML}" up -d --force-recreate && \
-           docker exec -e BENCHMARK_SAMPLES_NUM -i "${BENCHMARKING_CONTAINER}" \
+           docker exec -e BENCHMARK_RUNTIME_MODE -e BENCHMARK_SAMPLES_NUM \
+                  -i "${BENCHMARKING_CONTAINER}" \
                   script/benchmark/hello-bench/run.sh \
                   "${BENCHMARK_REGISTRY:-docker.io}/${BENCHMARK_USER}" \
                   ${BENCHMARK_TARGETS} &> "${LOG_FILE}" ) ; then

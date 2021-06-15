@@ -35,10 +35,29 @@ func main() {
 	app := app.New()
 	for i := range app.Commands {
 		if app.Commands[i].Name == "images" {
-			app.Commands[i].Subcommands = append(app.Commands[i].Subcommands, customCommands...)
+			sc := map[string]cli.Command{}
+			for _, subcmd := range customCommands {
+				sc[subcmd.Name] = subcmd
+			}
+
+			// First, replace duplicated subcommands
+			for j := range app.Commands[i].Subcommands {
+				for name, subcmd := range sc {
+					if name == app.Commands[i].Subcommands[j].Name {
+						app.Commands[i].Subcommands[j] = subcmd
+						delete(sc, name)
+					}
+				}
+			}
+
+			// Next, append all new sub commands
+			for _, subcmd := range sc {
+				app.Commands[i].Subcommands = append(app.Commands[i].Subcommands, subcmd)
+			}
 			break
 		}
 	}
+	app.Commands = append(app.Commands, commands.FanotifyCommand)
 	if err := app.Run(os.Args); err != nil {
 		fmt.Fprintf(os.Stderr, "ctr: %v\n", err)
 		os.Exit(1)

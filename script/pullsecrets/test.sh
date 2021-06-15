@@ -22,21 +22,31 @@ REGISTRY_HOST=kind-private-registry
 REGISTRY_NETWORK=kind_registry_network
 DUMMYUSER=dummyuser
 DUMMYPASS=dummypass
-TESTIMAGE="${REGISTRY_HOST}:5000/library/ubuntu:18.04"
+TESTIMAGE_ORIGIN="ghcr.io/stargz-containers/ubuntu:20.04"
+TESTIMAGE="${REGISTRY_HOST}:5000/library/ubuntu:20.04"
 KIND_CLUSTER_NAME=kind-stargz-snapshotter
+PREPARE_NODE_NAME="cri-prepare-node"
+PREPARE_NODE_IMAGE="cri-prepare-image"
 
 source "${REPO}/script/util/utils.sh"
+
+if [ "${KIND_NO_RECREATE:-}" != "true" ] ; then
+    echo "Preparing preparation node image..."
+    docker build ${DOCKER_BUILD_ARGS:-} -t "${PREPARE_NODE_IMAGE}" --target containerd-base "${REPO}"
+fi
 
 AUTH_DIR=$(mktemp -d)
 DOCKERCONFIG=$(mktemp)
 DOCKER_COMPOSE_YAML=$(mktemp)
 KIND_KUBECONFIG=$(mktemp)
+MIRROR_TMP=$(mktemp -d)
 function cleanup {
     local ORG_EXIT_CODE="${1}"
     rm -rf "${AUTH_DIR}" || true
     rm "${DOCKER_COMPOSE_YAML}" || true
     rm "${DOCKERCONFIG}" || true
     rm "${KIND_KUBECONFIG}" || true
+    rm -rf "${MIRROR_TMP}" || true
     exit "${ORG_EXIT_CODE}"
 }
 trap 'cleanup "$?"' EXIT SIGHUP SIGINT SIGQUIT SIGTERM
@@ -64,26 +74,38 @@ services:
     - REGISTRY_HTTP_TLS_KEY=/auth/certs/domain.key
     volumes:
     - ${AUTH_DIR}:/auth
+  image-prepare:
+    image: "${PREPARE_NODE_IMAGE}"
+    container_name: "${PREPARE_NODE_NAME}"
+    privileged: true
+    entrypoint:
+    - sleep
+    - infinity
+    tmpfs:
+    - /tmp:exec,mode=777
+    environment:
+    - REGISTRY_CREDS=${DUMMYUSER}:${DUMMYPASS}
+    volumes:
+    - "pullsecrets-prepare-containerd-data:/var/lib/containerd"
+    - "pullsecrets-prepare-containerd-stargz-grpc-data:/var/lib/containerd-stargz-grpc"
+    - "${AUTH_DIR}/certs/domain.crt:/usr/local/share/ca-certificates/rgst.crt:ro"
+    - "${REPO}:/go/src/github.com/containerd/stargz-snapshotter:ro"
+    - "${MIRROR_TMP}:/tools/"
+volumes:
+  pullsecrets-prepare-containerd-data:
+  pullsecrets-prepare-containerd-stargz-grpc-data:
 networks:
   default:
     external:
       name: ${REGISTRY_NETWORK}
 EOF
+
+cp "${REPO}/script/pullsecrets/mirror.sh" "${MIRROR_TMP}/mirror.sh"
 if ! ( cd "${CONTEXT}" && \
            docker network create "${REGISTRY_NETWORK}" && \
            docker-compose -f "${DOCKER_COMPOSE_YAML}" up -d --force-recreate && \
-           docker run --privileged --rm -i --network "${REGISTRY_NETWORK}" \
-                  --device /dev/fuse \
-                  --tmpfs "/tmp" \
-                  -v "${AUTH_DIR}/certs/domain.crt:/usr/local/share/ca-certificates/rgst.crt:ro" \
-                  -v "${DOCKERCONFIG}:/root/.docker/config.json:ro" \
-                  -v "${REPO}:/go/src/github.com/containerd/stargz-snapshotter:ro" \
-                  golang:1.13-buster /bin/bash -c "apt-get update -y && \
-apt-get --no-install-recommends install -y fuse && \
-update-ca-certificates && \
-cd /go/src/github.com/containerd/stargz-snapshotter && \
-PREFIX=/out/ make ctr-remote && \
-/out/ctr-remote images optimize ubuntu:18.04 ${TESTIMAGE}" ) ; then
+           docker exec "${PREPARE_NODE_NAME}" /bin/bash /tools/mirror.sh \
+                  "${TESTIMAGE_ORIGIN}" "${TESTIMAGE}" ) ; then
     echo "Failed to prepare private registry"
     docker-compose -f "${DOCKER_COMPOSE_YAML}" down -v
     docker network rm "${REGISTRY_NETWORK}"

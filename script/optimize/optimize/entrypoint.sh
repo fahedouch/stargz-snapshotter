@@ -16,13 +16,23 @@
 
 set -euo pipefail
 
-REGISTRY_HOST=registry-optimize
+REGISTRY_HOST=registry-optimize.test
 DUMMYUSER=dummyuser
 DUMMYPASS=dummypass
-ORG_IMAGE_TAG="${REGISTRY_HOST}:5000/test:org$(date '+%M%S')"
-OPT_IMAGE_TAG="${REGISTRY_HOST}:5000/test:opt$(date '+%M%S')"
-NOOPT_IMAGE_TAG="${REGISTRY_HOST}:5000/test:noopt$(date '+%M%S')"
+ORG_IMAGE_TAG="${REGISTRY_HOST}/test/test:org$(date '+%M%S')"
+OPT_IMAGE_TAG="${REGISTRY_HOST}/test/test:opt$(date '+%M%S')"
+NOOPT_IMAGE_TAG="${REGISTRY_HOST}/test/test:noopt$(date '+%M%S')"
 TOC_JSON_DIGEST_ANNOTATION="containerd.io/snapshot/stargz/toc.digest"
+UNCOMPRESSED_SIZE_ANNOTATION="io.containers.estargz.uncompressed-size"
+REMOTE_SNAPSHOTTER_SOCKET=/run/containerd-stargz-grpc/containerd-stargz-grpc.sock
+
+## Image for doing network-related tests
+#
+# FROM ubuntu:20.04
+# RUN apt-get update && apt-get install -y curl iproute2
+#
+NETWORK_MOUNT_TEST_ORG_IMAGE_TAG="ghcr.io/stargz-containers/ubuntu:20.04-curl-ip"
+########################################
 
 RETRYNUM=100
 RETRYINTERVAL=1
@@ -98,12 +108,29 @@ function validate_toc_json {
     return 0
 }
 
+function check_uncompressed_size {
+    local MANIFEST=${1}
+    local LAYER_NUM=${2}
+    local LAYER_TAR=${3}
+
+    SIZE_ANNOTATION="$(cat ${MANIFEST} | jq -r '.layers['"${LAYER_NUM}"'].annotations."'${UNCOMPRESSED_SIZE_ANNOTATION}'"')"
+    SIZE=$(cat "${LAYER_TAR}" | gunzip | wc -c)
+
+    if [ "${SIZE_ANNOTATION}" != "${SIZE}" ] ; then
+        echo "Invalid uncompressed size (layer:${LAYER_NUM}): want ${SIZE_ANNOTATION}; got: ${SIZE}"
+        return 1
+    fi
+
+    echo "Valid uncompressed size (layer:${LAYER_NUM}) ${SIZE_ANNOTATION} == ${SIZE}"
+    return 0
+}
+
 function check_optimization {
     local TARGET=${1}
 
     LOCAL_WORKING_DIR="${WORKING_DIR}/$(date '+%H%M%S')"
     mkdir "${LOCAL_WORKING_DIR}"
-    docker pull "${TARGET}" && docker save "${TARGET}" | tar xv -C "${LOCAL_WORKING_DIR}"
+    nerdctl pull "${TARGET}" && nerdctl save "${TARGET}" | tar xv -C "${LOCAL_WORKING_DIR}"
     LAYERS="$(cat "${LOCAL_WORKING_DIR}/manifest.json" | jq -r '.[0].Layers[]')"
 
     echo "Checking layers..."
@@ -132,36 +159,49 @@ function check_optimization {
         validate_toc_json "${LOCAL_WORKING_DIR}/dist-manifest.json" \
                           "${INDEX}" \
                           "${LOCAL_WORKING_DIR}/${L}"
+        check_uncompressed_size "${LOCAL_WORKING_DIR}/dist-manifest.json" \
+                                "${INDEX}" \
+                                "${LOCAL_WORKING_DIR}/${L}"
         ((INDEX+=1))
     done
 
     return 0
 }
 
-echo "Connecting to the docker server..."
-retry ls /docker/client/cert.pem /docker/client/ca.pem
-mkdir -p /root/.docker/ && cp /docker/client/* /root/.docker/
-retry docker version
+echo "===== VERSION INFORMATION ====="
+containerd --version
+runc --version
+echo "==============================="
 
 echo "Logging into the registry..."
 cp /auth/certs/domain.crt /usr/local/share/ca-certificates
 update-ca-certificates
-retry docker login "${REGISTRY_HOST}:5000" -u "${DUMMYUSER}" -p "${DUMMYPASS}"
+retry nerdctl login -u "${DUMMYUSER}" -p "${DUMMYPASS}" "https://${REGISTRY_HOST}"
+
+echo "Running containerd and BuildKit..."
+buildkitd --oci-cni-binary-dir=/opt/tmp/cni/bin &
+containerd --log-level debug &
+retry buildctl du
+retry nerdctl version
 
 echo "Building sample image for testing..."
 CONTEXT_DIR=$(mktemp -d)
 prepare_context "${CONTEXT_DIR}"
 
 echo "Preparing sample image..."
-tar zcv -C "${CONTEXT_DIR}" . \
-    | docker build -t "${ORG_IMAGE_TAG}" - \
-    && docker push "${ORG_IMAGE_TAG}"
+nerdctl build -t "${ORG_IMAGE_TAG}" "${CONTEXT_DIR}"
+nerdctl push "${ORG_IMAGE_TAG}"
+
+echo "Loading original image"
+nerdctl pull "${NETWORK_MOUNT_TEST_ORG_IMAGE_TAG}"
+nerdctl pull "${ORG_IMAGE_TAG}"
 
 echo "Checking optimized image..."
 WORKING_DIR=$(mktemp -d)
 PREFIX=/tmp/out/ make clean
 PREFIX=/tmp/out/ GO_BUILD_FLAGS="-race" make ctr-remote # Check data race
-/tmp/out/ctr-remote image optimize -entrypoint='[ "/accessor" ]' "${ORG_IMAGE_TAG}" "${OPT_IMAGE_TAG}"
+/tmp/out/ctr-remote ${OPTIMIZE_COMMAND} -entrypoint='[ "/accessor" ]' "${ORG_IMAGE_TAG}" "${OPT_IMAGE_TAG}"
+nerdctl push "${OPT_IMAGE_TAG}" || true
 cat <<EOF > "${WORKING_DIR}/0-want"
 accessor
 a.txt
@@ -189,7 +229,8 @@ check_optimization "${OPT_IMAGE_TAG}" \
                    "${WORKING_DIR}/2-want"
 
 echo "Checking non-optimized image..."
-/tmp/out/ctr-remote image optimize -no-optimize "${ORG_IMAGE_TAG}" "${NOOPT_IMAGE_TAG}"
+/tmp/out/ctr-remote ${NO_OPTIMIZE_COMMAND} "${ORG_IMAGE_TAG}" "${NOOPT_IMAGE_TAG}"
+nerdctl push "${NOOPT_IMAGE_TAG}" || true
 cat <<EOF > "${WORKING_DIR}/0-want"
 .no.prefetch.landmark
 a.txt
@@ -223,44 +264,21 @@ check_optimization "${NOOPT_IMAGE_TAG}" \
 # c.f. https://github.com/moby/moby/issues/26824
 update-alternatives --set iptables /usr/sbin/iptables-legacy
 
-# Install CNI plugins and configs to the customized paths (not /opt/cni/bin and /etc/cni/net.d)
-mkdir /tmp/cni/ /tmp/bin/
-curl -Ls https://github.com/containernetworking/plugins/releases/download/v0.8.7/cni-plugins-linux-amd64-v0.8.7.tgz | tar xzv -C /tmp/bin
-cat <<'EOF' > /tmp/cni/test.conflist
-{
-  "cniVersion": "0.4.0",
-  "name": "test",
-  "plugins" : [{
-    "type": "bridge",
-    "bridge": "test0",
-    "isDefaultGateway": true,
-    "forceAddress": false,
-    "ipMasq": true,
-    "hairpinMode": true,
-    "ipam": {
-      "type": "host-local",
-      "subnet": "10.10.0.0/16"
-    }
-  },
-  {
-    "type": "loopback"
-  }]
-}
-EOF
-
 # Try to connect to the internet from the container
+# CNI-related files are installed to irregular paths (see Dockerfile for more details).
+# Check if these files are recognized through flags.
 TESTDIR=$(mktemp -d)
-/tmp/out/ctr-remote i optimize \
+/tmp/out/ctr-remote ${OPTIMIZE_COMMAND} \
                     --period=20 \
                     --cni \
-                    --cni-plugin-conf-dir='/tmp/cni' \
-                    --cni-plugin-dir='/tmp/bin' \
+                    --cni-plugin-conf-dir='/etc/tmp/cni/net.d' \
+                    --cni-plugin-dir='/opt/tmp/cni/bin' \
                     --add-hosts='testhost:1.2.3.4,test2:5.6.7.8' \
                     --dns-nameservers='8.8.8.8' \
                     --mount="type=bind,src=${TESTDIR},dst=/mnt,options=bind" \
                     --entrypoint='[ "/bin/bash", "-c" ]' \
                     --args='[ "curl example.com > /mnt/result_page && ip a show dev eth0 ; echo -n $? > /mnt/if_exists && ip a > /mnt/if_info && cat /etc/hosts > /mnt/hosts" ]' \
-                    ghcr.io/stargz-containers/centos:8-test "${REGISTRY_HOST}:5000/test:1"
+                    "${NETWORK_MOUNT_TEST_ORG_IMAGE_TAG}" "${REGISTRY_HOST}/test:1"
 
 # Check if all contents are successfuly passed
 if ! [ -f "${TESTDIR}/if_exists" ] || \

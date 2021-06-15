@@ -23,16 +23,15 @@
 package reader
 
 import (
-	"archive/tar"
 	"bytes"
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/containerd/stargz-snapshotter/cache"
 	"github.com/containerd/stargz-snapshotter/estargz"
+	"github.com/containerd/stargz-snapshotter/util/testutil"
 	digest "github.com/opencontainers/go-digest"
 )
 
@@ -46,15 +45,19 @@ const (
 // Tests Reader for failure cases.
 func TestFailReader(t *testing.T) {
 	testFileName := "test"
-	stargzFile, _ := buildStargz(t, []tarent{
-		regfile(testFileName, sampleData1),
-	}, chunkSizeInfo(sampleChunkSize))
+	stargzFile, _, err := testutil.BuildEStargz([]testutil.TarEntry{
+		testutil.File(testFileName, sampleData1),
+	}, testutil.WithEStargzOptions(estargz.WithChunkSize(sampleChunkSize)))
+	if err != nil {
+		t.Fatalf("failed to build sample estargz")
+	}
 	br := &breakReaderAt{
 		ReaderAt: stargzFile,
 		success:  true,
 	}
 	bev := &testTOCEntryVerifier{true}
-	gr, _, err := newReader(io.NewSectionReader(br, 0, stargzFile.Size()), &nopCache{}, bev)
+	mcache := cache.NewMemoryCache()
+	gr, _, err := newReader(io.NewSectionReader(br, 0, stargzFile.Size()), mcache, bev)
 	if err != nil {
 		t.Fatalf("Failed to open stargz file: %v", err)
 	}
@@ -73,6 +76,7 @@ func TestFailReader(t *testing.T) {
 
 	for _, rs := range []bool{true, false} {
 		for _, vs := range []bool{true, false} {
+			mcache.(*cache.MemoryCache).Membuf = map[string]*bytes.Buffer{}
 			br.success = rs
 			bev.success = vs
 
@@ -137,38 +141,6 @@ func (bv *testVerifier) Write(p []byte) (n int, err error) {
 
 func (bv *testVerifier) Verified() bool {
 	return bv.success
-}
-
-type nopCache struct{}
-
-func (nc *nopCache) FetchAt(key string, offset int64, p []byte, opts ...cache.Option) (int, error) {
-	return 0, fmt.Errorf("Missed cache: %q", key)
-}
-
-func (nc *nopCache) Add(key string, p []byte, opts ...cache.Option) {}
-
-type testCache struct {
-	membuf map[string]string
-	t      *testing.T
-	mu     sync.Mutex
-}
-
-func (tc *testCache) FetchAt(key string, offset int64, p []byte, opts ...cache.Option) (int, error) {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-
-	cache, ok := tc.membuf[key]
-	if !ok {
-		return 0, fmt.Errorf("Missed cache: %q", key)
-	}
-	return copy(p, cache[offset:]), nil
-}
-
-func (tc *testCache) Add(key string, p []byte, opts ...cache.Option) {
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	tc.membuf[key] = string(p)
-	tc.t.Logf("  cached [%s...]: %q", key[:8], string(p))
 }
 
 type region struct{ b, e int64 }
@@ -236,7 +208,21 @@ func TestFileReadAt(t *testing.T) {
 							f := makeFile(t, []byte(sampleData1)[:filesize], sampleChunkSize)
 							f.ra = newExceptSectionReader(t, f.ra, cacheExcept...)
 							for _, reg := range cacheExcept {
-								f.cache.Add(genID(f.digest, reg.b, reg.e-reg.b+1), []byte(sampleData1[reg.b:reg.e+1]))
+								id := genID(f.digest, reg.b, reg.e-reg.b+1)
+								w, err := f.cache.Add(id)
+								if err != nil {
+									w.Close()
+									t.Fatalf("failed to add cache %v: %v", id, err)
+								}
+								if _, err := w.Write([]byte(sampleData1[reg.b : reg.e+1])); err != nil {
+									w.Close()
+									t.Fatalf("failed to write cache %v: %v", id, err)
+								}
+								if err := w.Commit(); err != nil {
+									w.Close()
+									t.Fatalf("failed to commit cache %v: %v", id, err)
+								}
+								w.Close()
 							}
 							respData := make([]byte, size)
 							n, err := f.ReadAt(respData, offset)
@@ -261,9 +247,15 @@ func TestFileReadAt(t *testing.T) {
 									break
 								}
 								data := make([]byte, ce.ChunkSize)
-								n, err := f.cache.FetchAt(genID(f.digest, ce.ChunkOffset, ce.ChunkSize), 0, data)
-								if err != nil || n != int(ce.ChunkSize) {
+								id := genID(f.digest, ce.ChunkOffset, ce.ChunkSize)
+								r, err := f.cache.Get(id)
+								if err != nil {
 									t.Errorf("missed cache of offset=%d, size=%d: %v(got size=%d)", ce.ChunkOffset, ce.ChunkSize, err, n)
+									return
+								}
+								defer r.Close()
+								if n, err := r.ReadAt(data, 0); (err != nil && err != io.EOF) || n != int(ce.ChunkSize) {
+									t.Errorf("failed to read cache of offset=%d, size=%d: %v(got size=%d)", ce.ChunkOffset, ce.ChunkSize, err, n)
 									return
 								}
 								nr += n
@@ -299,11 +291,14 @@ func (er *exceptSectionReader) ReadAt(p []byte, offset int64) (int, error) {
 	return er.ra.ReadAt(p, offset)
 }
 
-func makeFile(t *testing.T, contents []byte, chunkSize int64) *file {
+func makeFile(t *testing.T, contents []byte, chunkSize int) *file {
 	testName := "test"
-	sr, dgst := buildStargz(t, []tarent{
-		regfile(testName, string(contents)),
-	}, chunkSizeInfo(chunkSize))
+	sr, dgst, err := testutil.BuildEStargz([]testutil.TarEntry{
+		testutil.File(testName, string(contents)),
+	}, testutil.WithEStargzOptions(estargz.WithChunkSize(chunkSize)))
+	if err != nil {
+		t.Fatalf("failed to build sample estargz")
+	}
 
 	sgz, err := estargz.Open(sr)
 	if err != nil {
@@ -314,7 +309,7 @@ func makeFile(t *testing.T, contents []byte, chunkSize int64) *file {
 		t.Fatalf("failed to verify stargz: %v", err)
 	}
 
-	r, _, err := newReader(sr, &testCache{membuf: map[string]string{}, t: t}, ev)
+	r, _, err := newReader(sr, cache.NewMemoryCache(), ev)
 	if err != nil {
 		t.Fatalf("Failed to open stargz file: %v", err)
 	}
@@ -329,76 +324,16 @@ func makeFile(t *testing.T, contents []byte, chunkSize int64) *file {
 	return f
 }
 
-type tarent struct {
-	header   *tar.Header
-	contents []byte
-}
-
-func regfile(name string, contents string) tarent {
-	if strings.HasSuffix(name, "/") {
-		panic(fmt.Sprintf("file %q has suffix /", name))
-	}
-	return tarent{
-		header: &tar.Header{
-			Typeflag: tar.TypeReg,
-			Name:     name,
-			Mode:     0644,
-			Size:     int64(len(contents)),
-		},
-		contents: []byte(contents),
-	}
-}
-
-type chunkSizeInfo int
-
-func buildStargz(t *testing.T, ents []tarent, opts ...interface{}) (*io.SectionReader, digest.Digest) {
-	var chunkSize chunkSizeInfo
-	for _, opt := range opts {
-		if v, ok := opt.(chunkSizeInfo); ok {
-			chunkSize = v
-		} else {
-			t.Fatalf("unsupported opt")
-		}
-	}
-
-	tarBuf := new(bytes.Buffer)
-	tw := tar.NewWriter(tarBuf)
-	for _, ent := range ents {
-		if err := tw.WriteHeader(ent.header); err != nil {
-			t.Fatalf("writing header to the input tar: %v", err)
-		}
-		if _, err := tw.Write(ent.contents); err != nil {
-			t.Fatalf("writing contents to the input tar: %v", err)
-		}
-	}
-	if err := tw.Close(); err != nil {
-		t.Fatalf("closing write of input tar: %v", err)
-	}
-
-	tarData := tarBuf.Bytes()
-
-	rc, err := estargz.Build(
-		io.NewSectionReader(bytes.NewReader(tarData), 0, int64(len(tarData))),
-		estargz.WithChunkSize(int(chunkSize)),
-	)
-	if err != nil {
-		t.Fatalf("failed to build verifiable stargz: %v", err)
-	}
-	vsb := new(bytes.Buffer)
-	if _, err := io.Copy(vsb, rc); err != nil {
-		t.Fatalf("failed to copy built stargz blob: %v", err)
-	}
-	vsbb := vsb.Bytes()
-
-	return io.NewSectionReader(bytes.NewReader(vsbb), 0, int64(len(vsbb))), rc.TOCDigest()
-}
-
 func newReader(sr *io.SectionReader, cache cache.BlobCache, ev estargz.TOCEntryVerifier) (*reader, *estargz.TOCEntry, error) {
 	var r *reader
-	vr, root, err := NewReader(sr, cache)
+	vr, err := NewReader(sr, cache)
 	if vr != nil {
 		r = vr.r
 		r.verifier = ev
+	}
+	root, ok := r.Lookup("")
+	if !ok {
+		return nil, nil, fmt.Errorf("failed to get root")
 	}
 	return r, root, err
 }

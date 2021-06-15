@@ -16,7 +16,10 @@
 
 set -euo pipefail
 
-MEASURING_SCRIPT=./script/benchmark/hello-bench/src/hello.py
+CONTEXT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )/"
+REPO="${CONTEXT}../../../"
+MEASURING_SCRIPT="${REPO}/script/benchmark/hello-bench/src/hello.py"
+REBOOT_CONTAINERD_SCRIPT="${REPO}/script/benchmark/hello-bench/reboot_containerd.sh"
 
 if [ $# -lt 1 ] ; then
     echo "Specify benchmark target."
@@ -27,12 +30,5 @@ fi
 TARGET_REPOSITORY="${1}"
 TARGET_IMAGES=${@:2}
 
-if ! which ctr-remote ; then
-    echo "ctr-remote not found, installing..."
-    mkdir -p /tmp/out
-    PREFIX=/tmp/out/ make clean && \
-        PREFIX=/tmp/out/ make ctr-remote && \
-        install /tmp/out/ctr-remote /usr/local/bin
-fi
-
+DISABLE_ESTARGZ="true" "${REBOOT_CONTAINERD_SCRIPT}"
 "${MEASURING_SCRIPT}" --repository=${TARGET_REPOSITORY} --op=prepare ${TARGET_IMAGES}

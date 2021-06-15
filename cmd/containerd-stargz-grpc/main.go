@@ -19,47 +19,70 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	golog "log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"time"
 
-	"github.com/BurntSushi/toml"
 	snapshotsapi "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/contrib/snapshotservice"
+	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/stargz-snapshotter/cmd/containerd-stargz-grpc/keychain"
-	stargzfs "github.com/containerd/stargz-snapshotter/fs"
-	"github.com/containerd/stargz-snapshotter/fs/source"
-	snbase "github.com/containerd/stargz-snapshotter/snapshot"
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/hashicorp/go-multierror"
+	"github.com/containerd/containerd/pkg/dialer"
+	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/stargz-snapshotter/service"
+	"github.com/containerd/stargz-snapshotter/service/keychain/cri"
+	"github.com/containerd/stargz-snapshotter/service/keychain/dockerconfig"
+	"github.com/containerd/stargz-snapshotter/service/keychain/kubeconfig"
+	"github.com/containerd/stargz-snapshotter/service/resolver"
+	"github.com/containerd/stargz-snapshotter/version"
+	sddaemon "github.com/coreos/go-systemd/v22/daemon"
+	metrics "github.com/docker/go-metrics"
+	"github.com/pelletier/go-toml"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 const (
-	defaultAddress    = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
-	defaultConfigPath = "/etc/containerd-stargz-grpc/config.toml"
-	defaultLogLevel   = logrus.InfoLevel
-	defaultRootDir    = "/var/lib/containerd-stargz-grpc"
+	defaultAddress             = "/run/containerd-stargz-grpc/containerd-stargz-grpc.sock"
+	defaultConfigPath          = "/etc/containerd-stargz-grpc/config.toml"
+	defaultLogLevel            = logrus.InfoLevel
+	defaultRootDir             = "/var/lib/containerd-stargz-grpc"
+	defaultImageServiceAddress = "/run/containerd/containerd.sock"
 )
 
 var (
-	address    = flag.String("address", defaultAddress, "address for the snapshotter's GRPC server")
-	configPath = flag.String("config", defaultConfigPath, "path to the configuration file")
-	logLevel   = flag.String("log-level", defaultLogLevel.String(), "set the logging level [trace, debug, info, warn, error, fatal, panic]")
-	rootDir    = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
+	address      = flag.String("address", defaultAddress, "address for the snapshotter's GRPC server")
+	configPath   = flag.String("config", defaultConfigPath, "path to the configuration file")
+	logLevel     = flag.String("log-level", defaultLogLevel.String(), "set the logging level [trace, debug, info, warn, error, fatal, panic]")
+	rootDir      = flag.String("root", defaultRootDir, "path to the root directory for this snapshotter")
+	printVersion = flag.Bool("version", false, "print the version")
 )
+
+type snapshotterConfig struct {
+	service.Config
+
+	// MetricsAddress is address for the metrics API
+	MetricsAddress string `toml:"metrics_address"`
+}
 
 func main() {
 	flag.Parse()
 	lvl, err := logrus.ParseLevel(*logLevel)
 	if err != nil {
 		log.L.WithError(err).Fatal("failed to prepare logger")
+	}
+	if *printVersion {
+		fmt.Println("containerd-stargz-grpc", version.Version, version.Revision)
+		return
 	}
 	logrus.SetLevel(lvl)
 	logrus.SetFormatter(&logrus.JSONFormatter{
@@ -68,144 +91,151 @@ func main() {
 
 	var (
 		ctx    = log.WithLogger(context.Background(), log.L)
-		config Config
+		config snapshotterConfig
 	)
+	// Streams log of standard lib (go-fuse uses this) into debug log
+	// Snapshotter should use "github.com/containerd/containerd/log" otherwize
+	// logs are always printed as "debug" mode.
+	golog.SetOutput(log.G(ctx).WriterLevel(logrus.DebugLevel))
 
 	// Get configuration from specified file
-	if _, err := toml.DecodeFile(*configPath, &config); err != nil && !(os.IsNotExist(err) && *configPath == defaultConfigPath) {
+	tree, err := toml.LoadFile(*configPath)
+	if err != nil && !(os.IsNotExist(err) && *configPath == defaultConfigPath) {
 		log.G(ctx).WithError(err).Fatalf("failed to load config file %q", *configPath)
 	}
-
-	// Prepare kubeconfig-based keychain if required
-	kc := authn.DefaultKeychain
-	if config.KubeconfigKeychainConfig.EnableKeychain {
-		var opts []keychain.KubeconfigOption
-		if kcp := config.KubeconfigKeychainConfig.KubeconfigPath; kcp != "" {
-			opts = append(opts, keychain.WithKubeconfigPath(kcp))
-		}
-		kc = authn.NewMultiKeychain(kc, keychain.NewKubeconfigKeychain(ctx, opts...))
+	if err := tree.Unmarshal(&config); err != nil {
+		log.G(ctx).WithError(err).Fatalf("failed to unmarshal config file %q", *configPath)
 	}
 
-	// Use RegistryHosts based on ResolverConfig and keychain
-	hosts := hostsFromConfig(config.ResolverConfig, kc)
-
-	// Configure filesystem and snapshotter
-	fs, err := stargzfs.NewFilesystem(filepath.Join(*rootDir, "stargz"),
-		config.Config,
-		stargzfs.WithGetSources(sources(
-			sourceFromCRILabels(hosts),      // provides source info based on CRI labels
-			source.FromDefaultLabels(hosts), // provides source info based on default labels
-		)),
-	)
-	if err != nil {
-		log.G(ctx).WithError(err).Fatalf("failed to configure filesystem")
+	if err := service.Supported(*rootDir); err != nil {
+		log.G(ctx).WithError(err).Fatalf("snapshotter is not supported")
 	}
-	rs, err := snbase.NewSnapshotter(ctx, filepath.Join(*rootDir, "snapshotter"), fs, snbase.AsynchronousRemove)
-	if err != nil {
-		log.G(ctx).WithError(err).Fatalf("failed to configure snapshotter")
-	}
-	defer func() {
-		log.G(ctx).Debug("Closing the snapshotter")
-		rs.Close()
-		log.G(ctx).Info("Exiting")
-	}()
 
 	// Create a gRPC server
 	rpc := grpc.NewServer()
 
+	// Configure keychain
+	credsFuncs := []resolver.Credential{dockerconfig.NewDockerconfigKeychain(ctx)}
+	if config.Config.KubeconfigKeychainConfig.EnableKeychain {
+		var opts []kubeconfig.Option
+		if kcp := config.Config.KubeconfigKeychainConfig.KubeconfigPath; kcp != "" {
+			opts = append(opts, kubeconfig.WithKubeconfigPath(kcp))
+		}
+		credsFuncs = append(credsFuncs, kubeconfig.NewKubeconfigKeychain(ctx, opts...))
+	}
+	if config.Config.CRIKeychainConfig.EnableKeychain {
+		// connects to the backend CRI service (defaults to containerd socket)
+		criAddr := defaultImageServiceAddress
+		if cp := config.CRIKeychainConfig.ImageServicePath; cp != "" {
+			criAddr = cp
+		}
+		connectCRI := func() (runtime.ImageServiceClient, error) {
+			// TODO: make gRPC options configurable from config.toml
+			backoffConfig := backoff.DefaultConfig
+			backoffConfig.MaxDelay = 3 * time.Second
+			connParams := grpc.ConnectParams{
+				Backoff: backoffConfig,
+			}
+			gopts := []grpc.DialOption{
+				grpc.WithInsecure(),
+				grpc.WithConnectParams(connParams),
+				grpc.WithContextDialer(dialer.ContextDialer),
+				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
+				grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+			}
+			conn, err := grpc.Dial(dialer.DialAddress(criAddr), gopts...)
+			if err != nil {
+				return nil, err
+			}
+			return runtime.NewImageServiceClient(conn), nil
+		}
+		f, criServer := cri.NewCRIKeychain(ctx, connectCRI)
+		runtime.RegisterImageServiceServer(rpc, criServer)
+		credsFuncs = append(credsFuncs, f)
+	}
+	rs, err := service.NewStargzSnapshotterService(ctx, *rootDir, &config.Config, service.WithCredsFuncs(credsFuncs...))
+	if err != nil {
+		log.G(ctx).WithError(err).Fatalf("failed to configure snapshotter")
+	}
+
+	cleanup, err := serve(ctx, rpc, *address, rs, config)
+	if err != nil {
+		log.G(ctx).WithError(err).Fatalf("failed to serve snapshotter")
+	}
+
+	if cleanup {
+		log.G(ctx).Debug("Closing the snapshotter")
+		rs.Close()
+	}
+	log.G(ctx).Info("Exiting")
+}
+
+func serve(ctx context.Context, rpc *grpc.Server, addr string, rs snapshots.Snapshotter, config snapshotterConfig) (bool, error) {
 	// Convert the snapshotter to a gRPC service,
-	service := snapshotservice.FromSnapshotter(rs)
+	snsvc := snapshotservice.FromSnapshotter(rs)
 
 	// Register the service with the gRPC server
-	snapshotsapi.RegisterSnapshotsServer(rpc, service)
+	snapshotsapi.RegisterSnapshotsServer(rpc, snsvc)
 
 	// Prepare the directory for the socket
-	if err := os.MkdirAll(filepath.Dir(*address), 0700); err != nil {
-		log.G(ctx).WithError(err).Fatalf("failed to create directory %q", filepath.Dir(*address))
+	if err := os.MkdirAll(filepath.Dir(addr), 0700); err != nil {
+		return false, errors.Wrapf(err, "failed to create directory %q", filepath.Dir(addr))
 	}
 
 	// Try to remove the socket file to avoid EADDRINUSE
-	if err := os.RemoveAll(*address); err != nil {
-		log.G(ctx).WithError(err).Fatalf("failed to remove %q", *address)
+	if err := os.RemoveAll(addr); err != nil {
+		return false, errors.Wrapf(err, "failed to remove %q", addr)
+	}
+
+	errCh := make(chan error, 1)
+
+	if config.MetricsAddress != "" {
+		l, err := net.Listen("tcp", config.MetricsAddress)
+		if err != nil {
+			return false, errors.Wrapf(err, "failed to get listener for metrics endpoint")
+		}
+		m := http.NewServeMux()
+		m.Handle("/metrics", metrics.Handler())
+		go func() {
+			if err := http.Serve(l, m); err != nil {
+				errCh <- errors.Wrapf(err, "error on serving metrics via socket %q", addr)
+			}
+		}()
 	}
 
 	// Listen and serve
-	l, err := net.Listen("unix", *address)
+	l, err := net.Listen("unix", addr)
 	if err != nil {
-		log.G(ctx).WithError(err).Fatalf("error on listen socket %q", *address)
+		return false, errors.Wrapf(err, "error on listen socket %q", addr)
 	}
 	go func() {
 		if err := rpc.Serve(l); err != nil {
-			log.G(ctx).WithError(err).Fatalf("error on serving via socket %q", *address)
+			errCh <- errors.Wrapf(err, "error on serving via socket %q", addr)
 		}
 	}()
-	waitForSIGINT()
-	log.G(ctx).Info("Got SIGINT")
-}
 
-func waitForSIGINT() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	<-c
-}
-
-func hostsFromConfig(cfg ResolverConfig, keychain authn.Keychain) docker.RegistryHosts {
-	return func(host string) (hosts []docker.RegistryHost, _ error) {
-		for _, h := range append(cfg.Host[host].Mirrors, MirrorConfig{
-			Host: host,
-		}) {
-			tr := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
-			config := docker.RegistryHost{
-				Client:       tr,
-				Host:         h.Host,
-				Scheme:       "https",
-				Path:         "/v2",
-				Capabilities: docker.HostCapabilityPull,
-				Authorizer: docker.NewDockerAuthorizer(
-					docker.WithAuthClient(tr),
-					docker.WithAuthCreds(func(host string) (string, string, error) {
-						if host == "registry-1.docker.io" {
-							host = "index.docker.io"
-						}
-						reg, err := name.NewRegistry(host)
-						if err != nil {
-							return "", "", err
-						}
-						authn, err := keychain.Resolve(reg)
-						if err != nil {
-							return "", "", err
-						}
-						acfg, err := authn.Authorization()
-						if err != nil {
-							return "", "", err
-						}
-						if acfg.IdentityToken != "" {
-							return "", acfg.IdentityToken, nil
-						}
-						return acfg.Username, acfg.Password, nil
-					})),
-			}
-			if localhost, _ := docker.MatchLocalhost(config.Host); localhost || h.Insecure {
-				config.Scheme = "http"
-			}
-			if config.Host == "docker.io" {
-				config.Host = "registry-1.docker.io"
-			}
-			hosts = append(hosts, config)
-		}
-		return
+	if os.Getenv("NOTIFY_SOCKET") != "" {
+		notified, notifyErr := sddaemon.SdNotify(false, sddaemon.SdNotifyReady)
+		log.G(ctx).Debugf("SdNotifyReady notified=%v, err=%v", notified, notifyErr)
 	}
-}
-
-func sources(ps ...source.GetSources) source.GetSources {
-	return func(labels map[string]string) (source []source.Source, allErr error) {
-		for _, p := range ps {
-			src, err := p(labels)
-			if err == nil {
-				return src, nil
-			}
-			allErr = multierror.Append(allErr, err)
+	defer func() {
+		if os.Getenv("NOTIFY_SOCKET") != "" {
+			notified, notifyErr := sddaemon.SdNotify(false, sddaemon.SdNotifyStopping)
+			log.G(ctx).Debugf("SdNotifyStopping notified=%v, err=%v", notified, notifyErr)
 		}
-		return
+	}()
+
+	var s os.Signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM)
+	select {
+	case s = <-sigCh:
+		log.G(ctx).Infof("Got %v", s)
+	case err := <-errCh:
+		return false, err
 	}
+	if s == unix.SIGINT {
+		return true, nil // do cleanup on SIGINT
+	}
+	return false, nil
 }
